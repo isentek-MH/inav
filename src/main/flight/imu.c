@@ -72,11 +72,10 @@
 // http://gentlenav.googlecode.com/files/fastRotations.pdf
 
 #define SPIN_RATE_LIMIT             20
-#define MAX_ACC_SQ_NEARNESS         25      // 25% or G^2, accepted acceleration of (0.87 - 1.12G)
+#define MAX_ACC_SQ_NEARNESS         75      // 25% or G^2, accepted acceleration of (0.87 - 1.12G)
 #define MAX_GPS_HEADING_ERROR_DEG   60      // Amount of error between GPS CoG and estimated Yaw at witch we stop trusting GPS and fallback to MAG
 
 t_fp_vector imuAccelInBodyFrame;
-t_fp_vector imuMeasuredGravityBF;
 t_fp_vector imuMeasuredRotationBF;
 static float smallAngleCosZ = 0;
 
@@ -125,6 +124,21 @@ void imuUpdateGyroscope(timeUs_t gyroUpdateDeltaUs)
 }
 #endif
 
+#if defined(GPS) && defined(NAV)
+#define GPS_VEL_BUF_LENGTH 5
+static float gpsVelBuf_X[GPS_VEL_BUF_LENGTH], gpsVelBuf_Y[GPS_VEL_BUF_LENGTH], gpsVelBuf_Z[GPS_VEL_BUF_LENGTH];
+static firFilter_t gpsVelFilter_X, gpsVelFilter_Y, gpsVelFilter_Z;
+static float gpsInvDt = 0;
+
+static void imuInitGpsAccelFilter(void)
+{
+    /* First update or recovering from outage - reset filters */
+    const float gpsDefivCoeffs[GPS_VEL_BUF_LENGTH] = {5.0f/8, 2.0f/8, -8.0f/8, -2.0f/8, 3.0f/8};
+    firFilterInit(&gpsVelFilter_X, gpsVelBuf_X, GPS_VEL_BUF_LENGTH, gpsDefivCoeffs);
+    firFilterInit(&gpsVelFilter_Y, gpsVelBuf_Y, GPS_VEL_BUF_LENGTH, gpsDefivCoeffs);
+    firFilterInit(&gpsVelFilter_Z, gpsVelBuf_Z, GPS_VEL_BUF_LENGTH, gpsDefivCoeffs);
+}
+#endif
 
 STATIC_UNIT_TESTED void imuComputeRotationMatrix(void)
 {
@@ -170,6 +184,10 @@ void imuInit(void)
     }
 
     imuComputeRotationMatrix();
+
+#if defined(GPS) && defined(NAV)
+    imuInitGpsAccelFilter();
+#endif
 }
 
 void imuTransformVectorBodyToEarth(t_fp_vector * v)
@@ -447,20 +465,35 @@ STATIC_UNIT_TESTED void imuUpdateEulerAngles(void)
     }
 }
 
-static bool imuCanUseAccelerometerForCorrection(void)
+static bool imuCanUseAccelerometerForCorrection(t_fp_vector * grav)
 {
-    int32_t axis;
-    int32_t accMagnitudeSq = 0;
+    float accMagnitudeSq = 0;
 
-    for (axis = 0; axis < 3; axis++) {
-        accMagnitudeSq += (int32_t)acc.accADC[axis] * acc.accADC[axis];
-    }
+    accMagnitudeSq = sq(grav->V.X) + sq(grav->V.Y) + sq(grav->V.Z);
 
     // Magnitude^2 in percent of G^2
-    const int nearness = ABS(100 - (accMagnitudeSq * 100 / ((int32_t)acc.dev.acc_1G * acc.dev.acc_1G)));
+    const float nearness = 100.0f * accMagnitudeSq / sq(GRAVITY_CMSS);
 
-    return (nearness > MAX_ACC_SQ_NEARNESS) ? false : true;
+    return (nearness > MAX_ACC_SQ_NEARNESS) ? true : false;
 }
+
+#if defined(GPS) && defined(NAV)
+void imuReceiveGPSUpdate(const bool isFirstGPSUpdate, const float gpsDt, const t_fp_vector * gpsVel)
+{
+    if (isFirstGPSUpdate) {
+        firFilterReset(&gpsVelFilter_X, gpsVel->V.X);
+        firFilterReset(&gpsVelFilter_Y, gpsVel->V.Y);
+        firFilterReset(&gpsVelFilter_Z, gpsVel->V.Z);
+        gpsInvDt = 0;
+    }
+    else {
+        firFilterUpdate(&gpsVelFilter_X, gpsVel->V.X);
+        firFilterUpdate(&gpsVelFilter_Y, gpsVel->V.Y);
+        firFilterUpdate(&gpsVelFilter_Z, gpsVel->V.Z);
+        gpsInvDt = 1.0f / gpsDt;
+    }
+}
+#endif
 
 static void imuCalculateEstimatedAttitude(float dT)
 {
@@ -470,7 +503,28 @@ static void imuCalculateEstimatedAttitude(float dT)
     const bool canUseMAG = false;
 #endif
 
-    const bool useAcc = imuCanUseAccelerometerForCorrection();
+    // Calculate gravity in body frame (apply GPS-calculated acceleration if available)
+    t_fp_vector imuGravityInBodyFrame;
+    imuGravityInBodyFrame.V.X = imuAccelInBodyFrame.V.X;
+    imuGravityInBodyFrame.V.Y = imuAccelInBodyFrame.V.Y;
+    imuGravityInBodyFrame.V.Z = imuAccelInBodyFrame.V.Z;
+
+#if defined(GPS) && defined(NAV)
+    if (isImuHeadingValid() && sensors(SENSOR_GPS) && STATE(GPS_FIX) && gpsSol.numSat >= 6 && gpsSol.groundSpeed >= 300) {
+        // Calculate GPS acceleration and rotate to body frame
+        t_fp_vector gpsAccelInBodyFrame;
+        gpsAccelInBodyFrame.V.X = firFilterApply(&gpsVelFilter_X) * gpsInvDt;
+        gpsAccelInBodyFrame.V.Y = firFilterApply(&gpsVelFilter_Y) * gpsInvDt;
+        gpsAccelInBodyFrame.V.Z = firFilterApply(&gpsVelFilter_Z) * gpsInvDt;
+        imuTransformVectorEarthToBody(&gpsAccelInBodyFrame);
+
+        imuGravityInBodyFrame.V.X -= gpsAccelInBodyFrame.V.X;
+        imuGravityInBodyFrame.V.Y -= gpsAccelInBodyFrame.V.Y;
+        imuGravityInBodyFrame.V.Z -= gpsAccelInBodyFrame.V.Z;
+    }
+#endif
+
+    bool useAcc = imuCanUseAccelerometerForCorrection(&imuGravityInBodyFrame);
 
     float courseOverGround = 0;
     bool useMag = false;
@@ -521,7 +575,7 @@ static void imuCalculateEstimatedAttitude(float dT)
 #endif
 
     imuMahonyAHRSupdate(dT,     imuMeasuredRotationBF.A[X], imuMeasuredRotationBF.A[Y], imuMeasuredRotationBF.A[Z],
-                        useAcc, imuMeasuredGravityBF.A[X], imuMeasuredGravityBF.A[Y], imuMeasuredGravityBF.A[Z],
+                        useAcc, imuAccelInBodyFrame.A[X], imuAccelInBodyFrame.A[Y], imuAccelInBodyFrame.A[Z],
                         useMag, mag.magADC[X], mag.magADC[Y], mag.magADC[Z],
                         useCOG, courseOverGround);
 
@@ -556,7 +610,6 @@ static void imuUpdateMeasuredAcceleration(void)
 #ifdef ASYNC_GYRO_PROCESSING
     for (axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
         imuAccelInBodyFrame.A[axis] = imuAccumulatedAcc[axis] / imuAccumulatedAccCount;
-        imuMeasuredGravityBF.A[axis] = imuAccelInBodyFrame.A[axis];
         imuAccumulatedAcc[axis] = 0;
     }
     imuAccumulatedAccCount = 0;;
@@ -564,7 +617,6 @@ static void imuUpdateMeasuredAcceleration(void)
     /* Convert acceleration to cm/s/s */
     for (axis = 0; axis < XYZ_AXIS_COUNT; axis++) {
         imuAccelInBodyFrame.A[axis] = acc.accADC[axis] * (GRAVITY_CMSS / acc.dev.acc_1G);
-        imuMeasuredGravityBF.A[axis] = imuAccelInBodyFrame.A[axis];
     }
 #endif
 }
