@@ -72,7 +72,7 @@
 // http://gentlenav.googlecode.com/files/fastRotations.pdf
 
 #define SPIN_RATE_LIMIT             20
-#define MAX_ACC_SQ_NEARNESS         75      // 25% or G^2, accepted acceleration of (0.87 - 1.12G)
+#define MAX_ACC_SQ_NEARNESS         25      // 25% or G^2, accepted acceleration of (0.87 - 1.12G)
 #define MAX_GPS_HEADING_ERROR_DEG   60      // Amount of error between GPS CoG and estimated Yaw at witch we stop trusting GPS and fallback to MAG
 
 t_fp_vector imuAccelInBodyFrame;
@@ -467,13 +467,8 @@ STATIC_UNIT_TESTED void imuUpdateEulerAngles(void)
 
 static bool imuCanUseAccelerometerForCorrection(t_fp_vector * grav)
 {
-    float accMagnitudeSq = 0;
-
-    accMagnitudeSq = sq(grav->V.X) + sq(grav->V.Y) + sq(grav->V.Z);
-
-    // Magnitude^2 in percent of G^2
-    const float nearness = 100.0f * accMagnitudeSq / sq(GRAVITY_CMSS);
-
+    float accMagnitudeSq = sq(grav->V.X) + sq(grav->V.Y) + sq(grav->V.Z);
+    const float nearness = ABS(100.0f - 100.0f * accMagnitudeSq / sq(GRAVITY_CMSS));
     return (nearness > MAX_ACC_SQ_NEARNESS) ? true : false;
 }
 
@@ -510,7 +505,7 @@ static void imuCalculateEstimatedAttitude(float dT)
     imuGravityInBodyFrame.V.Z = imuAccelInBodyFrame.V.Z;
 
 #if defined(GPS) && defined(NAV)
-    if (isImuHeadingValid() && sensors(SENSOR_GPS) && STATE(GPS_FIX) && gpsSol.numSat >= 6 && gpsSol.groundSpeed >= 300) {
+    if (isImuHeadingValid() && sensors(SENSOR_GPS) && STATE(GPS_FIX) && gpsSol.numSat >= 6) {
         // Calculate GPS acceleration and rotate to body frame
         t_fp_vector gpsAccelInBodyFrame;
         gpsAccelInBodyFrame.V.X = firFilterApply(&gpsVelFilter_X) * gpsInvDt;
